@@ -6,6 +6,10 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Data;
+using System.IO;                   // ✅ 이모티콘 파일 경로 처리를 위해 추가
+using System.IO.Compression;   // ✅ ZIP 압축 해제용
+using System.Diagnostics;      // ✅ 탐색기 열기용
+
 
 namespace ChatClientApp
 {
@@ -23,6 +27,12 @@ namespace ChatClientApp
 
         // 이 채팅창이 대화하고 있는 상대방의 Users.id
         private readonly int _peerUserId;
+        // 공유 ZIP 파일 보관용 폴더 (양쪽 클라이언트가 같은 PC에서 실행된다고 가정)
+        private readonly string _sharedFileRoot =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shared_files");
+
+        // 파일 전송 버튼
+        private Button btnFile;
 
         // 표시용 상대방 이름 (DB Users.name/nickname 에서 가져옴)
         private string _peerDisplayName = "";
@@ -46,6 +56,8 @@ namespace ChatClientApp
         // 메시지 입력 / 전송 버튼
         private TextBox txtInput;
         private Button btnSend;
+        private Button btnEmoji;   // ✅ 이모티콘 버튼 필드 추가
+
 
         // 시스템 트레이(알림 영역) 아이콘
         private NotifyIcon notifyIcon1;
@@ -115,6 +127,14 @@ namespace ChatClientApp
             btnSearch.Click += btnSearch_Click;
             txtSearch.KeyDown += txtSearch_KeyDown;
 
+            // ✅ 이모티콘 버튼 클릭 이벤트
+            btnEmoji.Click += BtnEmoji_Click;
+            // ✅ 파일 전송 버튼 클릭 이벤트
+            btnFile.Click += BtnFile_Click;
+            if (!Directory.Exists(_sharedFileRoot))
+                Directory.CreateDirectory(_sharedFileRoot);
+
+
             // 트레이 아이콘 기본 설정
             notifyIcon1.Icon = SystemIcons.Information;
             notifyIcon1.Visible = true;
@@ -134,6 +154,358 @@ namespace ChatClientApp
             {
                 _client.OnIncoming -= Client_OnIncoming;
             };
+        }
+        private async void BtnFile_Click(object? sender, EventArgs e)
+        {
+            using var ofd = new OpenFileDialog();
+            ofd.Title = "전송할 파일 선택";
+            ofd.Filter = "모든 파일 (*.*)|*.*";
+
+            if (ofd.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            var originalPath = ofd.FileName;
+            var originalName = Path.GetFileName(originalPath);
+
+            // ZIP 파일 생성 이름
+            var zipId = Guid.NewGuid().ToString("N");
+            var zipFileName = zipId + ".zip";
+            var zipFullPath = Path.Combine(_sharedFileRoot, zipFileName);
+
+            try
+            {
+                // ZIP 생성
+                using (var zip = ZipFile.Open(zipFullPath, ZipArchiveMode.Create))
+                {
+                    zip.CreateEntryFromFile(originalPath, originalName);
+                }
+
+                // 서버로 전송할 텍스트
+                string marker = $"[FILE:{zipFileName}|{originalName}]";
+
+                await _client.SendTextAsync(_peerUserId, marker);
+
+                // 내 UI에도 표시
+                AppendFileMessage(true, "나", zipFileName, originalName, DateTime.Now);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"파일 전송 실패: {ex.Message}");
+            }
+        }
+        // [FILE:zipFileName|originalName] 형태인지 확인
+        private bool TryParseFileMarker(string text, out string zipFileName, out string originalName)
+        {
+            zipFileName = "";
+            originalName = "";
+
+            if (string.IsNullOrEmpty(text)) return false;
+            if (!text.StartsWith("[FILE:", StringComparison.OrdinalIgnoreCase)) return false;
+
+            int end = text.IndexOf(']');
+            if (end < 0) return false;
+
+            string inner = text.Substring(6, end - 6);  // "FILE:" 뒤부터
+            var parts = inner.Split('|');
+            if (parts.Length != 2) return false;
+
+            zipFileName = parts[0].Trim();
+            originalName = parts[1].Trim();
+
+            if (string.IsNullOrEmpty(zipFileName) || string.IsNullOrEmpty(originalName))
+                return false;
+
+            return true;
+        }
+        private void AppendFileMessage(bool isMe, string who, string zipFileName, string originalName, DateTime? when = null)
+        {
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action(() => AppendFileMessage(isMe, who, zipFileName, originalName, when)));
+                    return;
+                }
+
+                var ts = when ?? DateTime.Now;
+
+                // 날짜 구분선
+                if (_lastMessageDate == null || _lastMessageDate.Value.Date != ts.Date)
+                {
+                    AppendDateSeparator(ts.Date);
+                    _lastMessageDate = ts.Date;
+                }
+
+                int rowIndex = tlpChat.RowCount++;
+                tlpChat.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                var rowPanel = new FlowLayoutPanel
+                {
+                    AutoSize = true,
+                    Dock = DockStyle.Fill,
+                    WrapContents = false,
+                    Margin = new Padding(0),
+                    Padding = new Padding(0),
+                    FlowDirection = isMe ? FlowDirection.RightToLeft : FlowDirection.LeftToRight
+                };
+
+                var bubble = new Panel
+                {
+                    AutoSize = true,
+                    Padding = new Padding(8),
+                    Margin = new Padding(4),
+                    BackColor = isMe ? Color.LightGreen : Color.WhiteSmoke
+                };
+
+                int panelWidth = panelChat.ClientSize.Width;
+                if (panelWidth <= 0) panelWidth = panelChat.Width;
+                if (panelWidth <= 0) panelWidth = 400;
+                int maxWidth = Math.Max(150, panelWidth / 2 - 20);
+
+                var headerLabel = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(maxWidth, 0),
+                    Text = $"[{ts:HH:mm}] {who}: 파일 전송",
+                    Margin = new Padding(0, 0, 0, 4)
+                };
+
+                var link = new LinkLabel
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(maxWidth, 0),
+                    Text = $"📦 {originalName} 저장/압축해제",
+                    Tag = (zipFileName, originalName),
+                    Margin = new Padding(0)
+                };
+                link.LinkClicked += FileLink_LinkClicked;
+
+                var inner = new FlowLayoutPanel
+                {
+                    AutoSize = true,
+                    FlowDirection = FlowDirection.TopDown,
+                    Margin = new Padding(0),
+                    Padding = new Padding(0)
+                };
+                inner.Controls.Add(headerLabel);
+                inner.Controls.Add(link);
+
+                bubble.Controls.Add(inner);
+                rowPanel.Controls.Add(bubble);
+                tlpChat.Controls.Add(rowPanel, 0, rowIndex);
+
+                // 검색용 텍스트 저장
+                _messageList.Add((who, $"[FILE:{zipFileName}|{originalName}]", ts, isMe, bubble));
+
+                panelChat.ScrollControlIntoView(rowPanel);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("AppendFileMessage 오류: " + ex.Message);
+            }
+        }
+        private void FileLink_LinkClicked(object? sender, LinkLabelLinkClickedEventArgs e)
+        {
+            if (sender is not LinkLabel link) return;
+            if (link.Tag is not ValueTuple<string, string> tag) return;
+
+            var (zipFileName, originalName) = tag;
+
+            string zipFullPath = Path.Combine(_sharedFileRoot, zipFileName);
+            if (!File.Exists(zipFullPath))
+            {
+                MessageBox.Show("원본 ZIP 파일을 찾을 수 없습니다.\n" +
+                                "같은 PC에서 실행 중인지, shared_files 폴더가 있는지 확인하세요.");
+                return;
+            }
+
+            using var sfd = new SaveFileDialog();
+            sfd.Title = "ZIP 파일 저장 위치 선택";
+            sfd.FileName = originalName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
+                ? originalName
+                : originalName + ".zip";
+            sfd.Filter = "ZIP 파일 (*.zip)|*.zip|모든 파일 (*.*)|*.*";
+
+            if (sfd.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            try
+            {
+                // ZIP 복사
+                File.Copy(zipFullPath, sfd.FileName, overwrite: true);
+
+                // 압축 해제 폴더 (파일 이름 기반)
+                string extractDir = Path.Combine(
+                    Path.GetDirectoryName(sfd.FileName)!,
+                    Path.GetFileNameWithoutExtension(originalName)
+                );
+
+                Directory.CreateDirectory(extractDir);
+
+                ZipFile.ExtractToDirectory(sfd.FileName, extractDir, overwriteFiles: true);
+
+                MessageBox.Show($"저장 및 압축 해제 완료!\n\n폴더: {extractDir}");
+                System.Diagnostics.Process.Start("explorer.exe", extractDir);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("압축 해제 중 오류: " + ex.Message);
+            }
+        }
+
+        private void BtnEmoji_Click(object? sender, EventArgs e)
+        {
+            using (var picker = new EmojiPickerForm())
+            {
+                // 이모티콘 하나 클릭되었을 때 실행
+                picker.OnEmojiSelected += async (fileName) =>
+                {
+                    try
+                    {
+                        // 1) 프로토콜용 특수 문자열로 인코딩해서 서버로 전송
+                        string marker = $"[EMOJI:{fileName}]";
+                        await _client.SendTextAsync(_peerUserId, marker);
+
+                        // 2) 내 화면에도 즉시 이모티콘 말풍선 추가
+                        AppendEmojiMessage(true, "나", fileName, DateTime.Now);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"이모티콘 전송 실패: {ex.Message}");
+                    }
+                };
+
+                picker.StartPosition = FormStartPosition.Manual;
+                picker.Location = this.PointToScreen(new Point(10, this.Height - 400));
+                picker.ShowDialog(this);
+            }
+        }
+
+        // [EMOJI:파일명] 형태인지 확인하는 헬퍼
+        private bool TryParseEmojiMarker(string text, out string emojiFileName)
+        {
+            emojiFileName = "";
+
+            if (string.IsNullOrEmpty(text))
+                return false;
+
+            // 예: [EMOJI:smile1.png]
+            if (!text.StartsWith("[EMOJI:", StringComparison.OrdinalIgnoreCase) || !text.EndsWith("]"))
+                return false;
+
+            var inner = text.Substring(7, text.Length - 8); // "EMOJI:" 다음부터 마지막 ']' 전까지
+            if (string.IsNullOrWhiteSpace(inner))
+                return false;
+
+            emojiFileName = inner.Trim();
+            return true;
+        }
+
+        // 이모티콘(이미지) 말풍선 표시용
+        private void AppendEmojiMessage(bool isMe, string who, string emojiFileName, DateTime? when = null)
+        {
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action(() => AppendEmojiMessage(isMe, who, emojiFileName, when)));
+                    return;
+                }
+
+                var ts = when ?? DateTime.Now;
+
+                // 날짜 구분선 처리
+                if (_lastMessageDate == null || _lastMessageDate.Value.Date != ts.Date)
+                {
+                    AppendDateSeparator(ts.Date);
+                    _lastMessageDate = ts.Date;
+                }
+
+                int rowIndex = tlpChat.RowCount++;
+                tlpChat.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                var rowPanel = new FlowLayoutPanel
+                {
+                    AutoSize = true,
+                    Dock = DockStyle.Fill,
+                    WrapContents = false,
+                    Margin = new Padding(0),
+                    Padding = new Padding(0),
+                    FlowDirection = isMe ? FlowDirection.RightToLeft : FlowDirection.LeftToRight
+                };
+
+                var bubble = new Panel
+                {
+                    AutoSize = true,
+                    Padding = new Padding(8),
+                    Margin = new Padding(4),
+                    BackColor = isMe ? Color.LightGreen : Color.WhiteSmoke
+                };
+
+                // 이모티콘 이미지 로드
+                string emojiFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "emojis");
+                string fullPath = Path.Combine(emojiFolder, emojiFileName);
+
+                Control contentControl;
+
+                if (File.Exists(fullPath))
+                {
+                    var pic = new PictureBox
+                    {
+                        Size = new Size(100, 100),
+                        SizeMode = PictureBoxSizeMode.Zoom,
+                        Margin = new Padding(0)
+                    };
+
+                    using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read))
+                    {
+                        pic.Image = Image.FromStream(fs);
+                    }
+
+                    contentControl = pic;
+                }
+                else
+                {
+                    // 파일이 없으면 텍스트로 대체
+                    contentControl = new Label
+                    {
+                        AutoSize = true,
+                        Text = $"[이모티콘: {emojiFileName} (파일 없음)]"
+                    };
+                }
+
+                // 시간 + 이름 라벨
+                var headerLabel = new Label
+                {
+                    AutoSize = true,
+                    Text = $"[{ts:HH:mm}] {who}",
+                    Margin = new Padding(0, 0, 0, 4)
+                };
+
+                var innerPanel = new FlowLayoutPanel
+                {
+                    AutoSize = true,
+                    FlowDirection = FlowDirection.TopDown,
+                    Margin = new Padding(0),
+                    Padding = new Padding(0)
+                };
+
+                innerPanel.Controls.Add(headerLabel);
+                innerPanel.Controls.Add(contentControl);
+
+                bubble.Controls.Add(innerPanel);
+                rowPanel.Controls.Add(bubble);
+                tlpChat.Controls.Add(rowPanel, 0, rowIndex);
+
+                // 검색용 리스트에는 텍스트로 저장
+                _messageList.Add((who, $"[이모티콘:{emojiFileName}]", ts, isMe, bubble));
+
+                panelChat.ScrollControlIntoView(rowPanel);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("AppendEmojiMessage 오류: " + ex.Message);
+            }
         }
 
         // 🔥 ChatClientTcp.OnIncoming용 메서드 핸들러
@@ -167,13 +539,21 @@ namespace ChatClientApp
             {
                 bool isMe = (msg.FromUserId == _meUserId);
                 string who = isMe ? "나" : (_peerDisplayName == "" ? $"{_peerUserId}" : _peerDisplayName);
+                var when = msg.CreatedAt == default ? DateTime.Now : msg.CreatedAt;
 
-                AppendMessage(
-                    isMe,
-                    who,
-                    msg.Text,
-                    msg.CreatedAt == default ? DateTime.Now : msg.CreatedAt
-                );
+                // 🟡 이모티콘 → 파일 → 일반 텍스트 순서로 처리
+                if (TryParseEmojiMarker(msg.Text, out var emojiFile))
+                {
+                    AppendEmojiMessage(isMe, who, emojiFile, when);
+                }
+                else if (TryParseFileMarker(msg.Text, out var zipName, out var originalName))
+                {
+                    AppendFileMessage(isMe, who, zipName, originalName, when);
+                }
+                else
+                {
+                    AppendMessage(isMe, who, msg.Text, when);
+                }
             }
 
             // UI 스레드로 보냄
@@ -198,41 +578,6 @@ namespace ChatClientApp
             if (_roomId != 0)
             {
                 _ = _client.MarkReadAsync(_roomId);
-            }
-        }
-
-        private void LoadHistoryFromDb()
-        {
-            if (_roomId <= 0) return;
-
-            var dt = _db.Query(@"
-        SELECT sender_id, content, created_at
-        FROM Chat
-        WHERE chat_room_id = @roomId
-        ORDER BY created_at",
-                new MySqlParameter("@roomId", _roomId));
-
-            ClearMessages();
-            _lastMessageDate = null;
-
-            foreach (DataRow row in dt.Rows)
-            {
-                int senderId = row["sender_id"] == DBNull.Value
-                    ? 0
-                    : Convert.ToInt32(row["sender_id"]);
-
-                string text = row["content"] == DBNull.Value
-                    ? ""
-                    : row["content"].ToString();
-
-                DateTime createdAt = row["created_at"] == DBNull.Value
-                    ? DateTime.Now
-                    : Convert.ToDateTime(row["created_at"]);
-
-                bool isMe = (senderId == _meUserId);
-                string who = isMe ? "나" : _peerDisplayName;
-
-                AppendMessage(isMe, who, text, createdAt);
             }
         }
 
@@ -263,9 +608,22 @@ namespace ChatClientApp
                 {
                     bool isMe = (h.FromUserId == _meUserId);
                     string who = isMe ? "나" : _peerDisplayName;
+                    var when = h.CreatedAt;
 
-                    AppendMessage(isMe, who, h.Text, h.CreatedAt);
+                    if (TryParseEmojiMarker(h.Text, out var emojiFile))
+                    {
+                        AppendEmojiMessage(isMe, who, emojiFile, when);
+                    }
+                    else if (TryParseFileMarker(h.Text, out var zipName, out var originalName))
+                    {
+                        AppendFileMessage(isMe, who, zipName, originalName, when);
+                    }
+                    else
+                    {
+                        AppendMessage(isMe, who, h.Text, when);
+                    }
                 }
+
 
                 if (_roomId != 0)
                 {
@@ -565,6 +923,8 @@ namespace ChatClientApp
             tlpChat = new TableLayoutPanel();
             txtInput = new TextBox();
             btnSend = new Button();
+            btnEmoji = new Button();              // ✅ 이모티콘 버튼 생성
+            btnFile = new Button();
             notifyIcon1 = new NotifyIcon(components);
 
             SuspendLayout();
@@ -606,22 +966,43 @@ namespace ChatClientApp
 
             panelChat.Controls.Add(tlpChat);
 
+            // ✅ 파일 버튼 (클립 모양)
+            btnFile.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            btnFile.Location = new Point(16, 448);   // 📎는 맨 왼쪽
+            btnFile.Name = "btnFile";
+            btnFile.Size = new Size(40, 35);
+            btnFile.TabIndex = 3;
+            btnFile.Text = "📎";
+            btnFile.UseVisualStyleBackColor = true;
+
+            // ✅ 이모티콘 버튼
+            btnEmoji.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            // 👉 파일 버튼 오른쪽으로 한 칸 옮기기
+            btnEmoji.Location = new Point(64, 448);
+            btnEmoji.Name = "btnEmoji";
+            btnEmoji.Size = new Size(40, 35);
+            btnEmoji.TabIndex = 4;
+            btnEmoji.Text = "😀";
+            btnEmoji.UseVisualStyleBackColor = true;
+
             // txtInput
             txtInput.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-            txtInput.Location = new Point(16, 450);
+            // 👉 입력창도 오른쪽으로 조금 밀어주기
+            txtInput.Location = new Point(112, 450);
             txtInput.Name = "txtInput";
             txtInput.PlaceholderText = "메시지를 입력하세요…";
-            txtInput.Size = new Size(600, 31);
-            txtInput.TabIndex = 3;
+            txtInput.Size = new Size(504, 31);   // 원래 552였는데 살짝 줄임
+            txtInput.TabIndex = 5;
 
             // btnSend
             btnSend.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             btnSend.Location = new Point(628, 448);
             btnSend.Name = "btnSend";
             btnSend.Size = new Size(88, 35);
-            btnSend.TabIndex = 4;
+            btnSend.TabIndex = 6;
             btnSend.Text = "전송";
             btnSend.UseVisualStyleBackColor = true;
+
 
             // notifyIcon1
             notifyIcon1.Text = "Chat 알림";
@@ -633,6 +1014,8 @@ namespace ChatClientApp
             ClientSize = new Size(736, 498);
             Controls.Add(btnSend);
             Controls.Add(txtInput);
+            Controls.Add(btnEmoji);   // ✅ 폼에 추가
+            Controls.Add(btnFile);
             Controls.Add(panelChat);
             Controls.Add(btnSearch);
             Controls.Add(txtSearch);

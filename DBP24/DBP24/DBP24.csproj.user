@@ -7,6 +7,9 @@
     <Compile Update="ChatForm.cs">
       <SubType>Form</SubType>
     </Compile>
+    <Compile Update="EmojiPickerForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Update="FormAdminLogin.cs">
       <SubType>Form</SubType>
     </Compile>
